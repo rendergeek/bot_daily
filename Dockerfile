@@ -1,14 +1,13 @@
-# Dockerfile para el bot_daily
-FROM python:3.11-slim
+FROM python:3.10-slim
 
-# Crear directorio del bot
-WORKDIR /usr/src/bot_daily
+# Define el directorio de trabajo
+WORKDIR /usr/src/app
 
-# Copiar archivos del proyecto
+# Copia todos los archivos al contenedor
 COPY . .
 
-# Instalar dependencias
+# Instala dependencias
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Ejecutar bot al iniciar el contenedor
-CMD ["python", "bot_daily.py"]
+# Comando de inicio apuntando al script en /usr/src/app
+CMD ["python", "bot_kraken_daily.py"]
