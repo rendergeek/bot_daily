@@ -1,144 +1,158 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# bot_kraken_daily.py — Trading bot con RSI, EMA, MACD con envío de órdenes en EUR (paper trading)
 
 import os
-import sys
-import json
+import time
 import logging
 from datetime import datetime
 
 import ccxt
 import pandas as pd
-import ta
+import requests
+from dotenv import load_dotenv
 
+# 1) Carga de .env
+load_dotenv()
+KRAKEN_API_KEY       = os.getenv("KRAKEN_API_KEY")
+KRAKEN_API_SECRET    = os.getenv("KRAKEN_API_SECRET")
+DRY_RUN              = os.getenv("DRY_RUN", "True").lower() == "true"
+CAPITAL              = float(os.getenv("CAPITAL_INICIAL", "0"))  # en EUR
 
-# -----------------------------------------------------------
-# Configuración de logging
-# -----------------------------------------------------------
+# 2) Parámetros de estrategia
+RSI_OVERBOUGHT       = 70
+RSI_OVERSOLD         = 30
+MIN_VOLUME           = 1000      # volumen mínimo (en EUR de base)
+TIMEFRAME            = "1h"      # “1m”, “5m”, “15m”, “30m”, “1h”, “4h”, “1d”
+SLEEP_SECONDS        = 3600      # 1 hora
+
+# 3) Logger
+logger = logging.getLogger("kraken_bot")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-logger = logging.getLogger(__name__)
+
+# 4) Instancia CCXT Kraken (para órdenes)
+exchange = ccxt.kraken({
+    "apiKey": KRAKEN_API_KEY,
+    "secret": KRAKEN_API_SECRET,
+    "enableRateLimit": True,
+})
 
 
-# -----------------------------------------------------------
-# Carga y validación de variables de entorno
-# -----------------------------------------------------------
-# Symbol to trade, e.g. "XBT/USD"
-PAIR = os.getenv("PAIR")
-if not PAIR:
-    logger.error("Missing environment variable: PAIR")
-    sys.exit(1)
+def parse_interval(tf: str) -> int:
+    unit = tf[-1]
+    val  = int(tf[:-1])
+    if unit == "m": return val
+    if unit == "h": return val * 60
+    if unit == "d": return val * 1440
+    raise ValueError(f"Intervalo desconocido: {tf}")
 
-# Dry-run mode
-dry_run_env = os.getenv("DRY_RUN", "False")
-if dry_run_env.lower() in ("1", "true", "yes"):
-    DRY_RUN = True
-elif dry_run_env.lower() in ("0", "false", "no"):
-    DRY_RUN = False
-else:
-    logger.error(f"Invalid DRY_RUN value: {dry_run_env}. Use True or False.")
-    sys.exit(1)
-logger.info(f"Dry run mode: {DRY_RUN}")
 
-# Initial capital
-capital_env = os.getenv("CAPITAL_INICIAL")
-if capital_env is None:
-    logger.error("Missing environment variable: CAPITAL_INICIAL")
-    sys.exit(1)
+def fetch_ohlc(pair: str, timeframe: str = TIMEFRAME) -> pd.DataFrame:
+    interval = parse_interval(timeframe)
+    url      = "https://api.kraken.com/0/public/OHLC"
+    params   = {"pair": pair.replace("/", ""), "interval": interval}
+    resp     = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
 
-try:
-    CAPITAL = float(capital_env)
-except ValueError:
-    logger.error(f"Invalid CAPITAL_INICIAL value: '{capital_env}' is not a float.")
-    sys.exit(1)
-logger.info(f"Starting capital: {CAPITAL}")
+    result   = resp.json().get("result", {})
+    ohlc_key = next(k for k in result.keys() if k != "last")
+    raw      = result[ohlc_key]
 
-# Log file for operations
-LOG_FILE = os.getenv("LOG_FILE", "logs/trades.log")
-logger.info(f"Log file: {LOG_FILE}")
+    rows = []
+    for ts, o, h, l, c, vwap, vol, count in raw:
+        rows.append([ts, float(o), float(h), float(l), float(c), float(vol)])
+    df = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+
+    # Indicadores
+    df["ema_fast"] = df["close"].ewm(span=12).mean()
+    df["ema_slow"] = df["close"].ewm(span=26).mean()
+    delta = df["close"].diff()
+    gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df["macd"]   = df["ema_fast"] - df["ema_slow"]
+    df["signal"] = df["macd"].ewm(span=9).mean()
+
+    return df.dropna()
+
+
+def check_ema_crossover(df: pd.DataFrame, side: str) -> bool:
+    if len(df) < 2:
+        return False
+    prev, curr = df.iloc[-2], df.iloc[-1]
+    if side == "buy":
+        return (prev["ema_fast"] < prev["ema_slow"]) and (curr["ema_fast"] > curr["ema_slow"])
+    else:
+        return (prev["ema_fast"] > prev["ema_slow"]) and (curr["ema_fast"] < curr["ema_slow"])
+
+
+def generate_signal(df: pd.DataFrame) -> str | None:
+    last = df.iloc[-1]
+    if last["volume"] < MIN_VOLUME:
+        return None
+
+    rsi, macd, signal = last["rsi"], last["macd"], last["signal"]
+
+    if rsi < RSI_OVERSOLD and check_ema_crossover(df, "buy") and (macd > signal):
+        return "buy"
+
+    if rsi > RSI_OVERBOUGHT and check_ema_crossover(df, "sell") and (macd < signal):
+        return "sell"
+
+    return None
+
+
+def execute_order(pair: str, side: str, price: float):
+    amount = round(CAPITAL / price, 8)  # cantidad de BTC a comprar/vender
+    if DRY_RUN:
+        logger.info(
+            "[DRY RUN] %s %f %s @ %f EUR",
+            side.upper(), amount, pair, price
+        )
+    else:
+        try:
+            order = exchange.create_order(
+                symbol=pair, type="market", side=side, amount=amount
+            )
+            logger.info("ORDER EXECUTED: %s", order)
+        except Exception as e:
+            logger.error("Error ejecutando orden: %s", e, exc_info=True)
 
 
 def main():
-    logger.info(f"Fetching OHLCV for {PAIR}")
-    exchange = ccxt.kraken()
-    try:
-        ohlcv = exchange.fetch_ohlcv(PAIR, timeframe="1d", limit=100)
-    except Exception as e:
-        logger.error(f"Failed to fetch OHLCV: {e}")
-        sys.exit(1)
+    pair = "XBT/EUR"
+    logger.info("Bot arrancado para %s | DRY_RUN=%s", pair, DRY_RUN)
 
-    df = pd.DataFrame(ohlcv, columns=[
-        "timestamp", "open", "high", "low", "close", "volume"
-    ])
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
-
-    # === Cálculo de indicadores ===
-    logger.info("Calculating RSI, MACD, EMA(9), EMA(21)")
-    df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
-    macd = ta.trend.MACD(df["close"])
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    df["ema_fast"] = ta.trend.EMAIndicator(df["close"], window=9).ema_indicator()
-    df["ema_slow"] = ta.trend.EMAIndicator(df["close"], window=21).ema_indicator()
-
-    ultima = df.iloc[-1]
-
-    # === Dashboard básico ===
-    logger.info("🔎 Señales del día:")
-    logger.info(f"Fecha     : {ultima['datetime']}")
-    logger.info(f"Cierre    : {ultima['close']}")
-    logger.info(f"RSI       : {ultima['rsi']:.2f}")
-    logger.info(f"MACD      : {ultima['macd']:.2f}")
-    logger.info(f"Signal    : {ultima['macd_signal']:.2f}")
-    logger.info(f"EMA 9/21  : {ultima['ema_fast']:.2f}/{ultima['ema_slow']:.2f}")
-    logger.info(f"Volumen   : {int(ultima['volume'])}")
-
-    # === Lógica de señal ===
-    if (
-        ultima["rsi"] > 70
-        and ultima["macd"] < ultima["macd_signal"]
-        and ultima["ema_fast"] < ultima["ema_slow"]
-    ):
-        accion = "VENDER"
-    elif (
-        ultima["rsi"] < 30
-        and ultima["macd"] > ultima["macd_signal"]
-        and ultima["ema_fast"] > ultima["ema_slow"]
-    ):
-        accion = "COMPRAR"
-    else:
-        accion = "ESPERAR"
-
-    logger.info(f"✅ Acción recomendada: {accion}")
-
-    # === Logging de la operación (solo dry-run) ===
-    if DRY_RUN:
-        operacion = {
-            "fecha"     : str(ultima["datetime"]),
-            "pair"      : PAIR,
-            "accion"    : accion,
-            "precio"    : ultima["close"],
-            "rsi"       : float(ultima["rsi"]),
-            "macd"      : float(ultima["macd"]),
-            "macd_signal": float(ultima["macd_signal"]),
-            "ema_fast"  : float(ultima["ema_fast"]),
-            "ema_slow"  : float(ultima["ema_slow"]),
-            "volumen"   : float(ultima["volume"]),
-            "capital"   : CAPITAL
-        }
-
-        # Asegurarse de que exista el directorio
-        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-
+    while True:
+        logging.info("ciclo ejecutado - esperando proxima vela")
+        time.sleep(SLEEP_SECONDS)
         try:
-            with open(LOG_FILE, "a") as f:
-                f.write(json.dumps(operacion) + "\n")
-            logger.info(f"Operation logged to {LOG_FILE}")
+            df     = fetch_ohlc(pair)
+            signal = generate_signal(df)
+            price  = df.iloc[-1]["close"]
+            now    = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+
+            if signal == "buy":
+                logger.info("%s → SEÑAL COMPRA a %f EUR", now, price)
+                execute_order(pair, "buy", price)
+
+            elif signal == "sell":
+                logger.info("%s → SEÑAL VENTA a %f EUR", now, price)
+                execute_order(pair, "sell", price)
+
+            else:
+                logger.info("%s → ESPERAR (no hay señal)", now)
+
         except Exception as e:
-            logger.error(f"Failed to write log: {e}")
+            logger.error("Error en bucle principal: %s", e, exc_info=True)
+
+        time.sleep(SLEEP_SECONDS)
 
 
 if __name__ == "__main__":

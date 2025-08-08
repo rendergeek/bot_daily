@@ -10,4 +10,4 @@ COPY . .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Comando de inicio apuntando al script en /usr/src/app
-CMD ["python", "bot_kraken_daily.py"]
+CMD ["sh", "-c", "python bot_kraken_daily.py && python bot_kraken_hourly.py"]

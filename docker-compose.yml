@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  bot_hourly:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bot_hourly
+    command: python bot_kraken_hourly.py
+    volumes:
+      - ./logs_hourly:/usr/src/app/logs
+    environment:
+      - DRY_RUN=True
+
+  bot_daily:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bot_daily
+    command: python bot_kraken_daily.py
+    volumes:
+      - ./logs_daily:/usr/src/app/logs
+    environment:
+      - DRY_RUN=True
