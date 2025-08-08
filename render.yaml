@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: kraken-bot
+    env: python
+    plan: free
+    region: oregon  # o la región que prefieras
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: KRAKEN_API_KEY
+      - key: KRAKEN_API_SECRET
+      - key: DRY_RUN
+      - key: CAPITAL_INICIAL
